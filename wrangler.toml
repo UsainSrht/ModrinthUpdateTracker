@@ -1,0 +1,21 @@
+name = "modrinth-tracker"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# ─── Cron Trigger ────────────────────────────────────────────────────────────
+# Runs the scheduled handler every 10 minutes to poll Modrinth for new versions.
+[triggers]
+crons = ["*/10 * * * *"]
+
+# ─── D1 Database ─────────────────────────────────────────────────────────────
+# After running `npx wrangler d1 create modrinth-tracker`, paste the returned
+# database_id below.
+[[d1_databases]]
+binding      = "DB"
+database_name = "modrinth-tracker"
+database_id  = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# ─── Secrets (set via CLI, NOT in plain text here) ───────────────────────────
+# npx wrangler secret put DISCORD_BOT_TOKEN
+# npx wrangler secret put DISCORD_PUBLIC_KEY
+# npx wrangler secret put DISCORD_APP_ID

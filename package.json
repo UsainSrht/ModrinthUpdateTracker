@@ -1,0 +1,16 @@
+{
+  "name": "modrinth-bot",
+  "version": "1.0.0",
+  "description": "A Cloudflare Worker bot that tracks Modrinth project updates and posts them to Discord",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "register": "node register-commands.js",
+    "schema:local": "wrangler d1 execute modrinth-tracker --local --file=./schema.sql",
+    "schema:remote": "wrangler d1 execute modrinth-tracker --remote --file=./schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
