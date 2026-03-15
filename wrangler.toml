@@ -13,7 +13,7 @@ crons = ["*/10 * * * *"]
 [[d1_databases]]
 binding      = "DB"
 database_name = "modrinth-tracker"
-database_id  = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id  = "5c9f66b0-44bb-4ec8-b8a0-9648e7ec530e"
 
 # ─── Secrets (set via CLI, NOT in plain text here) ───────────────────────────
 # npx wrangler secret put DISCORD_BOT_TOKEN

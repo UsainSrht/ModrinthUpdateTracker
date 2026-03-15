@@ -17,6 +17,9 @@ const MODRINTH_API  = 'https://api.modrinth.com/v2';
 const DISCORD_API   = 'https://discord.com/api/v10';
 const MODRINTH_UA   = 'ModrinthUpdateTracker/1.0 (+https://modrinth-tracker.usainsrht.workers.dev)';
 const MODRINTH_GREEN = 0x1bd96a;
+const MODRINTH_RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const MODRINTH_INTERACTIVE_RETRY = { maxAttempts: 2, baseDelayMs: 120, jitterMs: 80 };
+const MODRINTH_SCHEDULED_RETRY = { maxAttempts: 3, baseDelayMs: 250, jitterMs: 150 };
 
 // Discord interaction types
 const InteractionType = { PING: 1, APPLICATION_COMMAND: 2 };
@@ -89,22 +92,63 @@ function extractProjectId(input) {
   return trimmed;
 }
 
-/** Fetch a project object from the Modrinth API. Returns null on failure. */
-async function modrinthGetProject(projectId) {
-  const res = await fetch(`${MODRINTH_API}/project/${encodeURIComponent(projectId)}`, {
-    headers: { 'User-Agent': MODRINTH_UA },
-  });
-  if (!res.ok) return null;
-  return res.json();
+/** Sleep helper for retry backoff delays. */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/** Fetch the version list for a project. Returns null on failure. */
-async function modrinthGetVersions(projectId) {
-  const res = await fetch(`${MODRINTH_API}/project/${encodeURIComponent(projectId)}/version`, {
-    headers: { 'User-Agent': MODRINTH_UA },
-  });
-  if (!res.ok) return null;
-  return res.json();
+/**
+ * Fetches JSON from Modrinth with retry/backoff for transient failures.
+ *
+ * Return shape:
+ *   { ok: true,  data }
+ *   { ok: false, reason: 'not_found' | 'unavailable', status? }
+ */
+async function modrinthFetchJson(path, retryOptions = MODRINTH_INTERACTIVE_RETRY) {
+  const {
+    maxAttempts = MODRINTH_INTERACTIVE_RETRY.maxAttempts,
+    baseDelayMs = MODRINTH_INTERACTIVE_RETRY.baseDelayMs,
+    jitterMs = MODRINTH_INTERACTIVE_RETRY.jitterMs,
+  } = retryOptions;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(`${MODRINTH_API}${path}`, {
+        headers: { 'User-Agent': MODRINTH_UA },
+      });
+
+      if (res.ok) {
+        return { ok: true, data: await res.json() };
+      }
+
+      if (res.status === 404) {
+        return { ok: false, reason: 'not_found', status: 404 };
+      }
+
+      if (!MODRINTH_RETRYABLE_STATUSES.has(res.status) || attempt === maxAttempts) {
+        return { ok: false, reason: 'unavailable', status: res.status };
+      }
+    } catch {
+      if (attempt === maxAttempts) {
+        return { ok: false, reason: 'unavailable' };
+      }
+    }
+
+    const backoffMs = baseDelayMs * (2 ** (attempt - 1)) + Math.floor(Math.random() * jitterMs);
+    await sleep(backoffMs);
+  }
+
+  return { ok: false, reason: 'unavailable' };
+}
+
+/** Fetch a project object from the Modrinth API. */
+async function modrinthGetProject(projectId, retryOptions) {
+  return modrinthFetchJson(`/project/${encodeURIComponent(projectId)}`, retryOptions);
+}
+
+/** Fetch the version list for a project. */
+async function modrinthGetVersions(projectId, retryOptions) {
+  return modrinthFetchJson(`/project/${encodeURIComponent(projectId)}/version`, retryOptions);
 }
 
 /**
@@ -158,12 +202,16 @@ async function handleTrack(interaction, env) {
     return interactionResponse('Please provide a valid Modrinth project URL or slug.', true);
   }
 
-  const [project, versions] = await Promise.all([
-    modrinthGetProject(projectId),
-    modrinthGetVersions(projectId),
-  ]);
+  const project = await modrinthGetProject(projectId, MODRINTH_INTERACTIVE_RETRY);
 
-  if (!project) {
+  if (!project.ok) {
+    if (project.reason !== 'not_found') {
+      return interactionResponse(
+        'Modrinth is temporarily unavailable right now. Please try again in a few seconds.',
+        true,
+      );
+    }
+
     return interactionResponse(
       `Could not find a Modrinth project matching \`${projectInput}\`. ` +
       'Check the URL or slug and try again.',
@@ -171,19 +219,23 @@ async function handleTrack(interaction, env) {
     );
   }
 
-  const latestVersionId = Array.isArray(versions) && versions.length > 0
-    ? versions[0].id
+  const projectData = project.data;
+  const versions = await modrinthGetVersions(projectData.id, MODRINTH_INTERACTIVE_RETRY);
+  const versionsData = versions.ok && Array.isArray(versions.data) ? versions.data : [];
+
+  const latestVersionId = versionsData.length > 0
+    ? versionsData[0].id
     : null;
 
   await env.DB
     .prepare(
       'INSERT OR REPLACE INTO subscriptions (channel_id, project_id, latest_version_id) VALUES (?, ?, ?)',
     )
-    .bind(channelId, project.id, latestVersionId)
+    .bind(channelId, projectData.id, latestVersionId)
     .run();
 
   return interactionResponse(
-    `Now tracking **${project.title}** in this channel.\n` +
+    `Now tracking **${projectData.title}** in this channel.\n` +
     `Latest version on record: \`${latestVersionId ?? 'none'}\``,
   );
 }
@@ -202,7 +254,15 @@ async function handleUntrack(interaction, env) {
   }
 
   // Resolve the canonical project.id even if a slug was provided.
-  const project = await modrinthGetProject(projectId);
+  const projectResult = await modrinthGetProject(projectId, MODRINTH_INTERACTIVE_RETRY);
+  if (!projectResult.ok && projectResult.reason !== 'not_found') {
+    return interactionResponse(
+      'Modrinth is temporarily unavailable right now. Please try again in a few seconds.',
+      true,
+    );
+  }
+
+  const project = projectResult.ok ? projectResult.data : null;
   const canonicalId = project?.id ?? projectId;
 
   const { meta } = await env.DB
@@ -247,31 +307,39 @@ async function handleContextMenu(interaction, env) {
   }
 
   const projectSlug = match[1];
-  const [project, versions] = await Promise.all([
-    modrinthGetProject(projectSlug),
-    modrinthGetVersions(projectSlug),
-  ]);
+  const project = await modrinthGetProject(projectSlug, MODRINTH_INTERACTIVE_RETRY);
 
-  if (!project) {
+  if (!project.ok) {
+    if (project.reason !== 'not_found') {
+      return interactionResponse(
+        'Modrinth is temporarily unavailable right now. Please try again in a few seconds.',
+        true,
+      );
+    }
+
     return interactionResponse(
       `Could not find a Modrinth project for slug \`${projectSlug}\`.`,
       true,
     );
   }
 
-  const latestVersionId = Array.isArray(versions) && versions.length > 0
-    ? versions[0].id
+  const projectData = project.data;
+  const versions = await modrinthGetVersions(projectData.id, MODRINTH_INTERACTIVE_RETRY);
+  const versionsData = versions.ok && Array.isArray(versions.data) ? versions.data : [];
+
+  const latestVersionId = versionsData.length > 0
+    ? versionsData[0].id
     : null;
 
   await env.DB
     .prepare(
       'INSERT OR REPLACE INTO subscriptions (channel_id, project_id, latest_version_id) VALUES (?, ?, ?)',
     )
-    .bind(channelId, project.id, latestVersionId)
+    .bind(channelId, projectData.id, latestVersionId)
     .run();
 
   return interactionResponse(
-    `Now tracking **${project.title}** in this channel.\n` +
+    `Now tracking **${projectData.title}** in this channel.\n` +
     `Latest version on record: \`${latestVersionId ?? 'none'}\``,
   );
 }
@@ -297,14 +365,24 @@ async function checkForUpdates(env) {
   }
 
   for (const [projectId, subscriptions] of projectMap) {
-    let versions;
+    let versionsResult;
     try {
-      versions = await modrinthGetVersions(projectId);
+      versionsResult = await modrinthGetVersions(projectId, MODRINTH_SCHEDULED_RETRY);
     } catch {
       continue; // Skip this project on network error; retry next cron tick.
     }
 
-    if (!Array.isArray(versions) || versions.length === 0) continue;
+    if (!versionsResult.ok) {
+      if (versionsResult.reason !== 'not_found') {
+        console.error(
+          `Failed to fetch versions for project ${projectId}: HTTP ${versionsResult.status ?? 'network'}`,
+        );
+      }
+      continue;
+    }
+
+    const versions = Array.isArray(versionsResult.data) ? versionsResult.data : [];
+    if (versions.length === 0) continue;
 
     const latestVersion   = versions[0];
     const previousVersion = versions[1] ?? null; // May be undefined for brand-new projects.
@@ -315,8 +393,8 @@ async function checkForUpdates(env) {
       // ── Resolve project metadata (needed for the embed title) ──────────────
       let projectTitle = projectId;
       try {
-        const project = await modrinthGetProject(projectId);
-        if (project?.title) projectTitle = project.title;
+        const projectResult = await modrinthGetProject(projectId, MODRINTH_SCHEDULED_RETRY);
+        if (projectResult.ok && projectResult.data?.title) projectTitle = projectResult.data.title;
       } catch { /* non-fatal */ }
 
       // ── Build loader + game-version diff strings ───────────────────────────
